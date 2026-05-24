@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      - DB_PATH=/data/prices.db   # override .env to use the persistent volume
+    volumes:
+      - bot_data:/data
+    restart: unless-stopped
+
+volumes:
+  bot_data:

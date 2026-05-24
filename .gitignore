@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+*.env
+
+# SQLite database
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Compiled binary
+steam-price-bot
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# macOS launchd plist (personal deployment config)
+*.plist
+
+# Test artefacts
+/tmp/
