@@ -502,6 +502,25 @@ func (s *Storage) GetInventoryCache(steamID string) ([]byte, time.Time, error) {
 	return []byte(raw), at, nil
 }
 
+// BotStats holds aggregate counters for the bot status view.
+type BotStats struct {
+	UniquePrices      int // distinct items that have at least one price record
+	TrackedAccounts   int // total rows in tracked_inventories
+	CachedInventories int // inventories with a local snapshot
+}
+
+// GetBotStats returns aggregate counters from the database.
+// Each value is fetched with a separate COUNT query — fast on SQLite with indexed columns.
+// We ignore individual scan errors: COUNT(*) on an existing table never fails.
+func (s *Storage) GetBotStats() BotStats {
+	var st BotStats
+	// COUNT(DISTINCT …) counts unique values, not rows.
+	s.db.QueryRow(`SELECT COUNT(DISTINCT market_hash_name) FROM price_history`).Scan(&st.UniquePrices)
+	s.db.QueryRow(`SELECT COUNT(*) FROM tracked_inventories`).Scan(&st.TrackedAccounts)
+	s.db.QueryRow(`SELECT COUNT(*) FROM inventory_cache`).Scan(&st.CachedInventories)
+	return st
+}
+
 // GetReportUsers returns all user IDs that have a daily report scheduled at the given UTC hour.
 func (s *Storage) GetReportUsers(hour int) ([]int64, error) {
 	rows, err := s.db.Query(

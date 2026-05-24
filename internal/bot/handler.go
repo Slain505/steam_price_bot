@@ -24,14 +24,15 @@ import (
 )
 
 type Bot struct {
-	api     *tgbotapi.BotAPI
-	store   *storage.Storage
-	steam   *steam.Client
-	tracker *tracker.Tracker
-	prices  *pricecache.Cache // bulk price cache fetched from Skinport
-	states  *stateManager
-	mu      sync.Mutex
-	working map[int64]bool
+	api       *tgbotapi.BotAPI
+	store     *storage.Storage
+	steam     *steam.Client
+	tracker   *tracker.Tracker
+	prices    *pricecache.Cache // bulk price cache fetched from Skinport
+	states    *stateManager
+	mu        sync.Mutex
+	working   map[int64]bool
+	startedAt time.Time // when the bot process started; used for uptime display
 }
 
 func New(token string, s *storage.Storage, sc *steam.Client, tr *tracker.Tracker, pc *pricecache.Cache) (*Bot, error) {
@@ -41,13 +42,14 @@ func New(token string, s *storage.Storage, sc *steam.Client, tr *tracker.Tracker
 	}
 	log.Printf("bot: authorized as @%s", api.Self.UserName)
 	b := &Bot{
-		api:     api,
-		store:   s,
-		steam:   sc,
-		tracker: tr,
-		prices:  pc,
-		states:  newStateManager(),
-		working: make(map[int64]bool),
+		api:       api,
+		store:     s,
+		steam:     sc,
+		tracker:   tr,
+		prices:    pc,
+		states:    newStateManager(),
+		working:   make(map[int64]bool),
+		startedAt: time.Now(),
 	}
 	tr.SetAlertFunc(b.sendAlert)
 	return b, nil
@@ -379,8 +381,48 @@ func (b *Bot) showSettings(chatID, userID int64, msgs i18n.M) {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(msgs.SettingsReport, "settings_report"),
 		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🤖 Bot Status", "bot_status"),
+		),
 	)
 	b.replyHTML(chatID, msgs.MenuSettings, &kb)
+}
+
+// cmdBotStatus sends a health card: uptime, last tracker run, and DB stats.
+//
+// 📖 Go concept: we call t.LastRun() which internally acquires a sync.Mutex —
+// this is safe to call from any goroutine.  b.startedAt is only ever written
+// once (inside New()), so it is safe to read without a lock.
+func (b *Bot) cmdBotStatus(chatID, userID int64) {
+	var sb strings.Builder
+	sb.WriteString("🤖 <b>Bot Status</b>\n\n")
+
+	// ── Uptime ──────────────────────────────────────────────────────────────
+	// b.startedAt was set once in New() — reads are safe without a lock.
+	sb.WriteString(fmt.Sprintf("⏱ <b>Uptime:</b> %s\n", formatAge(b.startedAt)))
+
+	// ── Tracker last run ────────────────────────────────────────────────────
+	// LastRun() acquires a mutex internally; returns zero value if never run.
+	lastRun := b.tracker.LastRun()
+	if lastRun.IsZero() {
+		// IsZero() returns true for the zero value of time.Time (Jan 1, year 1).
+		// The tracker hasn't finished its first tick yet.
+		sb.WriteString("🔄 <b>Last scan:</b> in progress…\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("🔄 <b>Last scan:</b> %s ago\n", formatAge(lastRun)))
+	}
+
+	// ── DB statistics ───────────────────────────────────────────────────────
+	// GetBotStats() runs three COUNT queries on the SQLite DB and returns a
+	// plain struct — no goroutine concerns here, SQLite driver handles its own
+	// locking.
+	stats := b.store.GetBotStats()
+	sb.WriteString("\n<b>📊 Database</b>\n")
+	sb.WriteString(fmt.Sprintf("  Items tracked: <b>%d</b>\n", stats.UniquePrices))
+	sb.WriteString(fmt.Sprintf("  Tracked accounts: <b>%d</b>\n", stats.TrackedAccounts))
+	sb.WriteString(fmt.Sprintf("  Cached inventories: <b>%d</b>\n", stats.CachedInventories))
+
+	b.replyHTML(chatID, sb.String(), nil)
 }
 
 func reportHourKeyboard(current int) *tgbotapi.InlineKeyboardMarkup {
@@ -458,6 +500,8 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 			id, _ := strconv.ParseInt(parts[1], 10, 64)
 			b.deleteAccount(chatID, userID, id, msgs)
 		}
+	case "bot_status":
+		b.cmdBotStatus(chatID, userID)
 	case "settings_lang":
 		b.replyHTML(chatID, msgs.ChooseLang, langKeyboard())
 	case "settings_currency":
@@ -2180,12 +2224,55 @@ func (b *Bot) alertList(chatID, userID int64) {
 	}
 	currency := b.getUserCurrency(userID)
 	sym := currency.Symbol
+
 	var sb strings.Builder
 	sb.WriteString(msgs.AlertHeader)
+	sb.WriteString("\n")
+
 	for _, a := range alerts {
-		fmt.Fprintf(&sb, "[%d] %s\n    ±%.0f%%  %s%.2f\n",
-			a.ID, esc(a.MarketHashName), a.Threshold, sym, a.BasePrice)
+		// Fetch the latest known price from the DB cache (no network call).
+		// GetLatestPrice returns (price, updatedAt, error).
+		current, _, priceErr := b.store.GetLatestPrice(a.MarketHashName)
+
+		// Build a status badge depending on whether the alert threshold is met.
+		//
+		// 📖 Go concept: math.Abs works on float64. We compute the percentage
+		// change relative to the saved base price and compare it to the user's
+		// configured threshold.
+		var statusLine string
+		if priceErr != nil || current == 0 || a.BasePrice == 0 {
+			// We don't have a cached price yet — show a neutral badge.
+			statusLine = "⏳ <i>No price data yet</i>"
+		} else {
+			changePct := (current - a.BasePrice) / a.BasePrice * 100
+
+			if math.Abs(changePct) >= a.Threshold {
+				// Alert is currently TRIGGERED.
+				direction := "📈"
+				if changePct < 0 {
+					direction = "📉"
+				}
+				statusLine = fmt.Sprintf(
+					"🔴 <b>TRIGGERED</b> %s %+.1f%%  now: %s%.2f",
+					direction, changePct, sym, current,
+				)
+			} else {
+				// Alert is watching but not yet triggered.
+				statusLine = fmt.Sprintf(
+					"🟢 Watching  %.1f%% / ±%.0f%%  now: %s%.2f",
+					math.Abs(changePct), a.Threshold, sym, current,
+				)
+			}
+		}
+
+		fmt.Fprintf(&sb, "[%d] <b>%s</b>\n    base: %s%.2f  threshold: ±%.0f%%\n    %s\n\n",
+			a.ID, esc(a.MarketHashName), sym, a.BasePrice, a.Threshold, statusLine)
 	}
+
+	// Reminder: auto spike alerts (≥+5% jump) fire instantly and are not
+	// listed here — they are ephemeral and sent directly as notifications.
+	sb.WriteString("<i>ℹ️ Auto spike alerts (≥+5%) fire instantly and are not shown here.</i>")
+
 	b.replyHTML(chatID, sb.String(), nil)
 }
 

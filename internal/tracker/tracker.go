@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/slain505/steam-price-bot/internal/steam"
@@ -22,6 +23,20 @@ type Tracker struct {
 	steam   *steam.Client
 	onAlert AlertFunc
 	quit    chan struct{}
+
+	// lastRun is written by the tracker goroutine and read by the bot goroutine,
+	// so access must be protected by a mutex to avoid a data race.
+	runMu   sync.Mutex
+	lastRun time.Time
+}
+
+// LastRun returns the time when the tracker last finished a full tick.
+// Returns zero value (time.Time{}) if the tracker hasn't completed a run yet.
+// Calling t.lastRun.IsZero() is how you check "has it run at all?".
+func (t *Tracker) LastRun() time.Time {
+	t.runMu.Lock()
+	defer t.runMu.Unlock()
+	return t.lastRun
 }
 
 func New(s *storage.Storage, sc *steam.Client) *Tracker {
@@ -80,6 +95,12 @@ func (t *Tracker) tick() {
 	if t.onAlert != nil {
 		t.fireAlerts()
 	}
+
+	// Record completion time — protected by mutex because LastRun() can
+	// be called from a different goroutine (the bot handler goroutine).
+	t.runMu.Lock()
+	t.lastRun = time.Now()
+	t.runMu.Unlock()
 }
 
 func (t *Tracker) refreshInventory(steamID string) {
