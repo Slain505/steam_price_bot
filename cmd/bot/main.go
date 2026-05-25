@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -51,19 +52,43 @@ func main() {
 	}
 	defer store.Close()
 
-	steamClient := steam.NewClient(sessionCookie, currency)
-	tr := tracker.New(store, steamClient)
+	// Backfill: enroll every existing account into the tracker. Older versions
+	// of the bot kept accounts and tracking as independent concepts, so users
+	// from those installs may have accounts that were never explicitly tracked.
+	if n, err := store.BackfillTrackingFromAccounts(); err != nil {
+		log.Printf("backfill tracking: %v", err)
+	} else if n > 0 {
+		log.Printf("backfill tracking: enrolled %d previously-untracked accounts", n)
+	}
 
-	// Start Skinport bulk price cache. Covers USD, EUR, GBP, PLN, UAH.
-	// RUB and KZT are not supported by Skinport and will fall back to Steam API.
+	steamClient := steam.NewClient(sessionCookie, currency)
+
+	// Skinport bulk price cache — only pre-load the bot's configured currency.
+	// Loading all currencies at once causes HTTP 429 from Skinport.
+	// RUB/KZT/UAH are not supported by Skinport and are silently skipped.
 	pc := pricecache.New()
-	pc.StartAutoRefresh([]string{"USD", "EUR", "GBP", "PLN", "UAH"})
+	skinportSupported := map[string]bool{"USD": true, "EUR": true, "GBP": true, "PLN": true}
+	if skinportSupported[currencyCode] {
+		pc.StartAutoRefresh([]string{currencyCode})
+	} else {
+		pc.StartAutoRefresh(nil) // unsupported currency — cache stays empty, Steam API used instead
+	}
 	defer pc.Stop()
 
-	b, err := bot.New(token, store, steamClient, tr, pc)
+	tr := tracker.New(store, steamClient, pc)
+
+	adminID, _ := strconv.ParseInt(os.Getenv("ADMIN_USER_ID"), 10, 64)
+	if adminID != 0 {
+		log.Printf("Admin user ID: %d", adminID)
+	}
+
+	b, err := bot.New(token, store, steamClient, tr, pc, adminID)
 	if err != nil {
 		log.Fatalf("bot: %v", err)
 	}
+
+	// Pipe operational warnings (stale cookie, etc.) into the admin chat.
+	tr.SetAdminNotifyFunc(b.NotifyAdmin)
 
 	tr.Start()
 	defer tr.Stop()

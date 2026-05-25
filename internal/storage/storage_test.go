@@ -450,3 +450,207 @@ func TestReportHour(t *testing.T) {
 		t.Errorf("after disabling user1: GetReportUsers(8): want 1, got %d", len(users))
 	}
 }
+
+// --- Tracker last run ---
+
+func TestTrackerLastRun_EmptyReturnsZero(t *testing.T) {
+	s := newTestDB(t)
+	if got := s.GetTrackerLastRun(); !got.IsZero() {
+		t.Errorf("empty DB: want zero time, got %v", got)
+	}
+}
+
+func TestTrackerLastRun_Roundtrip(t *testing.T) {
+	s := newTestDB(t)
+
+	// Pick a value with fractional seconds — UNIX storage drops sub-second precision,
+	// so we expect a truncated round-trip.
+	now := time.Now().UTC().Truncate(time.Second)
+	s.SaveTrackerLastRun(now)
+
+	got := s.GetTrackerLastRun()
+	if !got.Equal(now) {
+		t.Errorf("roundtrip mismatch: saved %v, got %v", now, got)
+	}
+}
+
+func TestTrackerLastRun_Overwrite(t *testing.T) {
+	s := newTestDB(t)
+
+	t1 := time.Unix(1700000000, 0).UTC()
+	t2 := time.Unix(1700000001, 0).UTC()
+
+	s.SaveTrackerLastRun(t1)
+	s.SaveTrackerLastRun(t2)
+
+	got := s.GetTrackerLastRun()
+	if !got.Equal(t2) {
+		t.Errorf("overwrite failed: want %v, got %v", t2, got)
+	}
+}
+
+// --- BotStats ---
+
+func TestGetBotStats(t *testing.T) {
+	s := newTestDB(t)
+
+	// Empty DB
+	stats := s.GetBotStats()
+	if stats.UniquePrices != 0 || stats.TrackedAccounts != 0 || stats.CachedInventories != 0 {
+		t.Errorf("empty stats: want all 0, got %+v", stats)
+	}
+
+	// Populate
+	_ = s.SavePrice("Item A", 1.0)
+	_ = s.SavePrice("Item A", 2.0) // duplicate — should count as 1 UniquePrices
+	_ = s.SavePrice("Item B", 3.0)
+	_ = s.TrackInventory(1, "76561198000000001")
+	_ = s.TrackInventory(2, "76561198000000002")
+	_ = s.SaveInventoryCache("76561198000000001", []byte(`[]`))
+
+	stats = s.GetBotStats()
+	if stats.UniquePrices != 2 {
+		t.Errorf("UniquePrices: want 2, got %d", stats.UniquePrices)
+	}
+	if stats.TrackedAccounts != 2 {
+		t.Errorf("TrackedAccounts: want 2, got %d", stats.TrackedAccounts)
+	}
+	if stats.CachedInventories != 1 {
+		t.Errorf("CachedInventories: want 1, got %d", stats.CachedInventories)
+	}
+}
+
+// --- Account ↔ Tracking sync ---
+
+func TestRemoveAccount_AlsoUntracks(t *testing.T) {
+	s := newTestDB(t)
+	const uid = int64(1)
+
+	// Add an account and start tracking it.
+	if err := s.AddAccount(uid, "76561198000000001", "Main"); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if err := s.TrackInventory(uid, "76561198000000001"); err != nil {
+		t.Fatalf("TrackInventory: %v", err)
+	}
+
+	accs, _ := s.GetAccounts(uid)
+	if len(accs) != 1 {
+		t.Fatalf("setup: expected 1 account, got %d", len(accs))
+	}
+	tracked, _ := s.GetTrackedInventories(uid)
+	if len(tracked) != 1 {
+		t.Fatalf("setup: expected 1 tracked, got %d", len(tracked))
+	}
+
+	// Removing the account should also remove the tracking row.
+	if err := s.RemoveAccount(uid, accs[0].ID); err != nil {
+		t.Fatalf("RemoveAccount: %v", err)
+	}
+	accs, _ = s.GetAccounts(uid)
+	if len(accs) != 0 {
+		t.Errorf("after RemoveAccount: want 0 accounts, got %d", len(accs))
+	}
+	tracked, _ = s.GetTrackedInventories(uid)
+	if len(tracked) != 0 {
+		t.Errorf("after RemoveAccount: want 0 tracked, got %d", len(tracked))
+	}
+}
+
+func TestBackfillTrackingFromAccounts_EnrollsAll(t *testing.T) {
+	s := newTestDB(t)
+
+	// Two users, each with two accounts — none of them tracked.
+	_ = s.AddAccount(1, "76561198000000001", "U1A1")
+	_ = s.AddAccount(1, "76561198000000002", "U1A2")
+	_ = s.AddAccount(2, "76561198000000003", "U2A1")
+	_ = s.AddAccount(2, "76561198000000004", "U2A2")
+
+	n, err := s.BackfillTrackingFromAccounts()
+	if err != nil {
+		t.Fatalf("BackfillTrackingFromAccounts: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("expected 4 backfilled rows, got %d", n)
+	}
+
+	all, _ := s.GetAllTrackedInventories()
+	if len(all) != 4 {
+		t.Errorf("expected 4 tracked inventories, got %d", len(all))
+	}
+}
+
+func TestBackfillTrackingFromAccounts_Idempotent(t *testing.T) {
+	s := newTestDB(t)
+
+	_ = s.AddAccount(1, "76561198000000001", "Main")
+	// First call enrolls.
+	n1, _ := s.BackfillTrackingFromAccounts()
+	if n1 != 1 {
+		t.Errorf("first call: want 1 row, got %d", n1)
+	}
+	// Second call must be a no-op.
+	n2, _ := s.BackfillTrackingFromAccounts()
+	if n2 != 0 {
+		t.Errorf("second call: want 0 new rows (idempotent), got %d", n2)
+	}
+}
+
+func TestBackfillTrackingFromAccounts_PreservesExistingTracking(t *testing.T) {
+	s := newTestDB(t)
+
+	// Account A is already explicitly tracked.
+	_ = s.AddAccount(1, "76561198000000001", "Tracked")
+	_ = s.TrackInventory(1, "76561198000000001")
+	// Account B is added but never tracked.
+	_ = s.AddAccount(1, "76561198000000002", "Untracked")
+
+	// Backfill should add B without disrupting A.
+	n, _ := s.BackfillTrackingFromAccounts()
+	if n != 1 {
+		t.Errorf("backfill added: want 1 (only B), got %d", n)
+	}
+	tracked, _ := s.GetTrackedInventories(1)
+	if len(tracked) != 2 {
+		t.Errorf("after backfill: want 2 tracked, got %d", len(tracked))
+	}
+}
+
+// --- Inventory cache ---
+
+func TestInventoryCache_RoundTrip(t *testing.T) {
+	s := newTestDB(t)
+
+	// No cache yet
+	data, at, err := s.GetInventoryCache("76561198000000001")
+	if err != nil || data != nil || !at.IsZero() {
+		t.Errorf("empty cache: want (nil, zero, nil), got (%v, %v, %v)", data, at, err)
+	}
+
+	// Save and read back
+	payload := []byte(`[{"market_hash_name":"AK-47 | Redline"}]`)
+	if err := s.SaveInventoryCache("76561198000000001", payload); err != nil {
+		t.Fatalf("SaveInventoryCache: %v", err)
+	}
+
+	data, at, err = s.GetInventoryCache("76561198000000001")
+	if err != nil {
+		t.Fatalf("GetInventoryCache: %v", err)
+	}
+	if string(data) != string(payload) {
+		t.Errorf("payload mismatch: want %s, got %s", payload, data)
+	}
+	if at.IsZero() {
+		t.Errorf("cached_at should be set")
+	}
+
+	// Overwrite
+	newPayload := []byte(`[{"market_hash_name":"AWP | Asiimov"}]`)
+	if err := s.SaveInventoryCache("76561198000000001", newPayload); err != nil {
+		t.Fatalf("SaveInventoryCache overwrite: %v", err)
+	}
+	data, _, _ = s.GetInventoryCache("76561198000000001")
+	if string(data) != string(newPayload) {
+		t.Errorf("overwrite: want %s, got %s", newPayload, data)
+	}
+}
