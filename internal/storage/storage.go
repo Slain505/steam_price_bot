@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,10 +30,10 @@ type Alert struct {
 
 // EntryPriceRecord stores the reference ("entry") price used for P&L calculations.
 type EntryPriceRecord struct {
-	UserID          int64
-	MarketHashName  string
-	EntryPrice      float64
-	FirstSeenAt     time.Time
+	UserID         int64
+	MarketHashName string
+	EntryPrice     float64
+	FirstSeenAt    time.Time
 }
 
 // Account represents a named Steam account stored for a Telegram user.
@@ -103,6 +104,10 @@ func (s *Storage) migrate() error {
 			steam_id  TEXT     PRIMARY KEY,
 			items     TEXT     NOT NULL,
 			cached_at DATETIME NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS bot_config (
+		    key   TEXT PRIMARY KEY,
+		    value TEXT NOT NULL
 		)`,
 	}
 	for _, stmt := range stmts {
@@ -295,11 +300,49 @@ func (s *Storage) AddAccount(userID int64, steamID, name string) error {
 	return err
 }
 
+// RemoveAccount deletes the account row AND its matching tracking entry so
+// the tracker stops refreshing an inventory the user no longer owns/cares
+// about. Both deletes happen unconditionally — if either is already absent,
+// the DELETE is a no-op.
 func (s *Storage) RemoveAccount(userID, accountID int64) error {
-	_, err := s.db.Exec(
+	// Look up the steamID first so we can untrack by (userID, steamID).
+	var steamID string
+	_ = s.db.QueryRow(
+		`SELECT steam_id FROM accounts WHERE id = ? AND user_id = ?`,
+		accountID, userID,
+	).Scan(&steamID)
+
+	if _, err := s.db.Exec(
 		`DELETE FROM accounts WHERE id = ? AND user_id = ?`, accountID, userID,
+	); err != nil {
+		return err
+	}
+	if steamID != "" {
+		_, _ = s.db.Exec(
+			`DELETE FROM tracked_inventories WHERE user_id = ? AND steam_id = ?`,
+			userID, steamID,
+		)
+	}
+	return nil
+}
+
+// BackfillTrackingFromAccounts inserts a tracked_inventories row for every
+// account that doesn't already have one. Idempotent — safe to call on every
+// startup. Returns how many new tracking rows were created (for logging).
+//
+// This exists because earlier versions of the bot only added the account to
+// the accounts table and required a separate /track command to start
+// tracking. Now tracking is implicit, and this method catches up old data.
+func (s *Storage) BackfillTrackingFromAccounts() (int, error) {
+	res, err := s.db.Exec(
+		`INSERT OR IGNORE INTO tracked_inventories (user_id, steam_id, added_at)
+		 SELECT user_id, steam_id, added_at FROM accounts`,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (s *Storage) HasAccount(userID int64, steamID string) (bool, error) {
@@ -539,4 +582,32 @@ func (s *Storage) GetReportUsers(hour int) ([]int64, error) {
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// --- Bot tracker info  ---
+
+// GetTrackerLastRun returns the persisted timestamp of the last tracker run,
+// or zero Time if the tracker has never recorded a run yet.
+// Stored as a decimal Unix-seconds string in bot_config.value (TEXT column).
+func (s *Storage) GetTrackerLastRun() time.Time {
+	var raw string
+	err := s.db.QueryRow(`SELECT value FROM bot_config WHERE key = 'tracker_last_run'`).Scan(&raw)
+	if err != nil || raw == "" {
+		return time.Time{}
+	}
+	ts, perr := strconv.ParseInt(raw, 10, 64)
+	if perr != nil || ts == 0 {
+		return time.Time{}
+	}
+	return time.Unix(ts, 0).UTC()
+}
+
+// SaveTrackerLastRun persists the timestamp of the last completed tracker run.
+// Stored as a decimal string so the value matches bot_config.value's TEXT type
+// instead of relying on SQLite's flexible type-affinity coercion.
+func (s *Storage) SaveTrackerLastRun(t time.Time) {
+	s.db.Exec(
+		`INSERT OR REPLACE INTO bot_config (key, value) VALUES ('tracker_last_run', ?)`,
+		strconv.FormatInt(t.Unix(), 10),
+	)
 }

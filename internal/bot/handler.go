@@ -33,26 +33,63 @@ type Bot struct {
 	mu        sync.Mutex
 	working   map[int64]bool
 	startedAt time.Time // when the bot process started; used for uptime display
+	adminID   int64     // Telegram user ID allowed to use /admin; 0 = disabled
+
+	// Per-user cooldown for forceRefresh — protects Steam API from spam-clicks.
+	refreshMu       sync.Mutex
+	lastForceByUser map[int64]time.Time
 }
 
-func New(token string, s *storage.Storage, sc *steam.Client, tr *tracker.Tracker, pc *pricecache.Cache) (*Bot, error) {
+// forceRefreshCooldown is the minimum interval between two forceRefresh calls
+// from the same user. Steam rate-limits aggressively, so we throttle here.
+const forceRefreshCooldown = 60 * time.Second
+
+func New(token string, s *storage.Storage, sc *steam.Client, tr *tracker.Tracker, pc *pricecache.Cache, adminID int64) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
 	}
 	log.Printf("bot: authorized as @%s", api.Self.UserName)
 	b := &Bot{
-		api:       api,
-		store:     s,
-		steam:     sc,
-		tracker:   tr,
-		prices:    pc,
-		states:    newStateManager(),
-		working:   make(map[int64]bool),
-		startedAt: time.Now(),
+		api:             api,
+		store:           s,
+		steam:           sc,
+		tracker:         tr,
+		prices:          pc,
+		states:          newStateManager(),
+		working:         make(map[int64]bool),
+		startedAt:       time.Now(),
+		adminID:         adminID,
+		lastForceByUser: make(map[int64]time.Time),
 	}
 	tr.SetAlertFunc(b.sendAlert)
 	return b, nil
+}
+
+// checkForceCooldown returns 0 if the user can force-refresh now, or the
+// remaining cooldown otherwise. Records the new attempt time on success.
+func (b *Bot) checkForceCooldown(userID int64) time.Duration {
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
+	if last, ok := b.lastForceByUser[userID]; ok {
+		elapsed := time.Since(last)
+		if elapsed < forceRefreshCooldown {
+			return forceRefreshCooldown - elapsed
+		}
+	}
+	b.lastForceByUser[userID] = time.Now()
+	return 0
+}
+
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("bot: panic in %s: %v", name, r)
+			}
+		}()
+		fn()
+	}()
 }
 
 // flushPendingUpdates discards any Telegram updates that accumulated while the
@@ -82,12 +119,12 @@ func (b *Bot) Start() {
 	u.Timeout = 60
 	for update := range b.api.GetUpdatesChan(u) {
 		if update.CallbackQuery != nil {
-			go b.handleCallback(update.CallbackQuery)
+			safeGo("callback", func() { b.handleCallback(update.CallbackQuery) })
 		} else if update.Message != nil {
 			if update.Message.IsCommand() {
-				go b.dispatch(update.Message)
+				safeGo("dispatch", func() { b.dispatch(update.Message) })
 			} else if update.Message.Text != "" {
-				go b.handleText(update.Message)
+				safeGo("text", func() { b.handleText(update.Message) })
 			}
 		}
 	}
@@ -196,6 +233,8 @@ func (b *Bot) dispatch(m *tgbotapi.Message) {
 		b.cmdExport(chatID, userID, strings.TrimSpace(m.CommandArguments()))
 	case "alert":
 		b.cmdAlert(m)
+	case "admin":
+		b.cmdAdmin(chatID, userID)
 	}
 }
 
@@ -275,6 +314,12 @@ func (b *Bot) handleAccNameInput(chatID, userID int64, name, steamID string, onb
 	if err := b.store.AddAccount(userID, steamID, name); err != nil {
 		b.replyHTML(chatID, fmt.Sprintf(msgs.ErrGeneric, esc(err.Error())), nil)
 		return
+	}
+	// Auto-track: every newly added account is enrolled in the hourly tracker
+	// so prices start updating immediately. The user can still /untrack later
+	// if they don't want a specific account refreshed.
+	if err := b.store.TrackInventory(userID, steamID); err != nil {
+		log.Printf("auto-track on add: %v", err)
 	}
 	b.states.clear(userID)
 	if onboarding {
@@ -386,6 +431,50 @@ func (b *Bot) showSettings(chatID, userID int64, msgs i18n.M) {
 		),
 	)
 	b.replyHTML(chatID, msgs.MenuSettings, &kb)
+}
+
+// isAdmin returns true when userID matches the configured admin Telegram ID.
+// If no admin ID is configured (adminID == 0), always returns false.
+func (b *Bot) isAdmin(userID int64) bool {
+	return b.adminID != 0 && userID == b.adminID
+}
+
+// cmdAdmin shows the admin control panel.
+// Access is silently denied for non-admin users — no error message, no hint.
+func (b *Bot) cmdAdmin(chatID, userID int64) {
+	if !b.isAdmin(userID) {
+		return // silently ignore — don't reveal the command exists
+	}
+
+	lastRun := b.tracker.LastRun()
+	var lastRunStr string
+	if lastRun.IsZero() {
+		lastRunStr = "never"
+	} else {
+		lastRunStr = formatAge(lastRun) + " ago"
+	}
+
+	text := fmt.Sprintf(
+		"🛡 <b>Admin Panel</b>\n\n"+
+			"⏱ Uptime: <b>%s</b>\n"+
+			"🔄 Last tick: <b>%s</b>\n\n"+
+			"Use the buttons below to manage the bot.",
+		formatAge(b.startedAt),
+		lastRunStr,
+	)
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Force Refresh", "admin_tick"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔔 Test Alerts (all users)", "admin_fire_alerts"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📊 Bot Status", "bot_status"),
+		),
+	)
+	b.replyHTML(chatID, text, &kb)
 }
 
 // cmdBotStatus sends a health card: uptime, last tracker run, and DB stats.
@@ -502,6 +591,24 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		}
 	case "bot_status":
 		b.cmdBotStatus(chatID, userID)
+	case "admin_tick":
+		if !b.isAdmin(userID) {
+			return
+		}
+		ok := b.tracker.ForceRefresh()
+		var reply string
+		if ok {
+			reply = "🔄 <b>Force refresh started.</b>\nPrices are being updated from Skinport cache.\nCheck /admin in ~10 seconds to see the updated last-tick time."
+		} else {
+			reply = "⏳ A tick is already in progress. Try again in a moment."
+		}
+		b.replyHTML(chatID, reply, nil)
+	case "admin_fire_alerts":
+		if !b.isAdmin(userID) {
+			return
+		}
+		b.tracker.FireTestAlerts()
+		b.replyHTML(chatID, "🔔 <b>Test alerts sent</b> to all users with configured alerts.\nCheck that messages arrived.", nil)
 	case "settings_lang":
 		b.replyHTML(chatID, msgs.ChooseLang, langKeyboard())
 	case "settings_currency":
@@ -737,6 +844,17 @@ func (b *Bot) cmdInventory(chatID int64, userID int64, steamID string, forceRefr
 		b.menuInventory(chatID, userID, msgs)
 		return
 	}
+	// Throttle forceRefresh per user — Steam rate-limits aggressively, so
+	// spam-clicking 🔄 Refresh must not pile Steam requests on top of each other.
+	if forceRefresh {
+		if remaining := b.checkForceCooldown(userID); remaining > 0 {
+			b.sendText(chatID, fmt.Sprintf(
+				"⏳ Wait %d sec before refreshing again — Steam rate-limits us hard.",
+				int(remaining.Seconds())+1,
+			))
+			return
+		}
+	}
 	if !b.tryLock(userID) {
 		b.sendText(chatID, msgs.WorkingBusy)
 		return
@@ -772,97 +890,70 @@ func (b *Bot) cmdInventory(chatID int64, userID int64, steamID string, forceRefr
 		price float64
 	}
 	var priced []pricedItem
-	var noPrice int // items for which no price was available
+	var noPriceItems []steam.Item // items with no price — shown at the bottom with names
 
-	if fromCache {
-		// Fast path: prices come from DB — no Steam API calls.
-		for _, it := range marketable {
-			price, _, _ := b.store.GetLatestPrice(it.MarketHashName)
+	currCode := b.store.GetCurrency(userID)
+
+	// Unified pipeline for both fast and slow paths.
+	// Resolve every marketable item: DB → Skinport → (on forceRefresh) Steam API.
+	var needSteam []steam.Item // items missing after DB+Skinport
+	for _, it := range marketable {
+		// Tier 1: DB
+		price, _, _ := b.store.GetLatestPrice(it.MarketHashName)
+		// Tier 2: Skinport bulk cache (instant, no API call)
+		if price == 0 && b.prices != nil {
+			price = b.prices.Get(it.MarketHashName, currCode)
 			if price > 0 {
-				priced = append(priced, pricedItem{it, price})
-			} else {
-				noPrice++
+				_ = b.store.SavePrice(it.MarketHashName, price)
+				_ = b.store.SetEntryPriceIfNew(userID, it.MarketHashName, price)
 			}
 		}
-	} else {
-		// Slow path: fresh inventory from Steam.
-		// DB-first: use cached prices for known items; only call Steam for brand-new items.
-		type fetchJob struct{ item steam.Item }
-		var toFetch []fetchJob
-		for _, it := range marketable {
-			price, _, _ := b.store.GetLatestPrice(it.MarketHashName)
-			if price > 0 {
-				priced = append(priced, pricedItem{it, price})
-			} else {
-				toFetch = append(toFetch, fetchJob{it})
-			}
-		}
-
-		if len(toFetch) > 0 {
-			cached := len(marketable) - len(toFetch)
-			b.editText(chatID, progressMsg.MessageID,
-				fmt.Sprintf(msgs.GettingPricesNew, len(toFetch), cached))
-
-			// Step 1: Skinport bulk cache — resolve as many items as possible instantly.
-			// This avoids per-item Steam API calls for brand-new items.
-			if b.prices != nil {
-				currCode := b.store.GetCurrency(userID)
-				var stillToFetch []fetchJob
-				for _, job := range toFetch {
-					if spPrice := b.prices.Get(job.item.MarketHashName, currCode); spPrice > 0 {
-						_ = b.store.SavePrice(job.item.MarketHashName, spPrice)
-						_ = b.store.SetEntryPriceIfNew(userID, job.item.MarketHashName, spPrice)
-						priced = append(priced, pricedItem{job.item, spPrice})
-					} else {
-						stillToFetch = append(stillToFetch, job)
-					}
-				}
-				toFetch = stillToFetch
-			}
-
-			// Step 2: Items still without a price — fall back to Steam API one by one.
-			for done, job := range toFetch {
-				// Update progress on every item (or every 3 for large lists).
-				step := 1
-				if len(toFetch) > 30 {
-					step = 3
-				}
-				if done%step == 0 {
-					b.editText(chatID, progressMsg.MessageID,
-						fmt.Sprintf(msgs.PricesProgress, done+1, len(toFetch)))
-				}
-
-				// Retry up to 3 times on rate limit.
-				var price float64
-				var fetchErr error
-				for attempt := 0; attempt <= 3; attempt++ {
-					price, fetchErr = b.steam.FetchPrice(job.item.MarketHashName, currency.Code)
-					if fetchErr == nil || !errors.Is(fetchErr, steam.ErrRateLimit) {
-						break
-					}
-					delay := (attempt + 1) * 5
-					// Show progress + retry notice together.
-					b.editText(chatID, progressMsg.MessageID,
-						fmt.Sprintf(msgs.PricesRetrying, done+1, len(toFetch), delay))
-					time.Sleep(time.Duration(delay) * time.Second)
-				}
-				if fetchErr != nil {
-					log.Printf("price %s: %v", job.item.MarketHashName, fetchErr)
-					noPrice++
-					continue
-				}
-				if price > 0 {
-					_ = b.store.SavePrice(job.item.MarketHashName, price)
-					_ = b.store.SetEntryPriceIfNew(userID, job.item.MarketHashName, price)
-					priced = append(priced, pricedItem{job.item, price})
-				} else {
-					noPrice++ // item exists but has no market listing
-				}
-			}
+		if price > 0 {
+			priced = append(priced, pricedItem{it, price})
+		} else {
+			needSteam = append(needSteam, it)
 		}
 	}
 
-	if len(priced) == 0 {
+	// Tier 3: Steam API fallback — only when user explicitly hits Refresh,
+	// because Steam rate-limits aggressively (~1 req/1.5 s).
+	if forceRefresh && len(needSteam) > 0 {
+		b.editText(chatID, progressMsg.MessageID,
+			fmt.Sprintf("🔍 Fetching %d prices from Steam…", len(needSteam)))
+		for done, it := range needSteam {
+			step := 1
+			if len(needSteam) > 30 {
+				step = 3
+			}
+			if done%step == 0 {
+				b.editText(chatID, progressMsg.MessageID,
+					fmt.Sprintf(msgs.PricesProgress, done+1, len(needSteam)))
+			}
+			// 1 retry only — Steam 429s aggressively, more retries just pile up.
+			// Items that fail here are picked up by the hourly tracker next tick.
+			price, err := b.steam.FetchPriceWithRetry(it.MarketHashName, currency.Code, 1)
+			if err != nil {
+				log.Printf("price %s: %v", it.MarketHashName, err)
+				noPriceItems = append(noPriceItems, it)
+				continue
+			}
+			if price > 0 {
+				_ = b.store.SavePrice(it.MarketHashName, price)
+				_ = b.store.SetEntryPriceIfNew(userID, it.MarketHashName, price)
+				priced = append(priced, pricedItem{it, price})
+			} else {
+				noPriceItems = append(noPriceItems, it)
+			}
+		}
+	} else {
+		// Not a forced refresh — list missing items so the user knows what's missing.
+		noPriceItems = append(noPriceItems, needSteam...)
+	}
+
+	// fromCache is only used for the "instant" UX expectation; flow above handles both.
+	_ = fromCache
+
+	if len(priced) == 0 && len(noPriceItems) == 0 {
 		b.editText(chatID, progressMsg.MessageID, msgs.NoPrices)
 		return
 	}
@@ -872,14 +963,21 @@ func (b *Bot) cmdInventory(chatID int64, userID int64, steamID string, forceRefr
 	})
 
 	const limit = 20
-	topN := priced[:min(limit, len(priced))]
+	showN := min(limit, len(priced))
+	topN := priced[:showN]
 
 	var sb strings.Builder
 	accName := b.store.GetAccountName(userID, steamID)
-	fmt.Fprintf(&sb, msgs.InventoryHeader, esc(accName), min(limit, len(priced)))
+	if showN > 0 {
+		fmt.Fprintf(&sb, msgs.InventoryHeader, esc(accName), showN)
+	} else {
+		// No priced items — show a different header so it doesn't say "топ 0".
+		fmt.Fprintf(&sb, "📦 <b>%s</b> — %d items, no prices yet\n\n",
+			esc(accName), len(noPriceItems))
+	}
 
 	var topTotal float64
-	for _, e := range topN {
+	for i, e := range topN {
 		val := e.price * float64(e.item.Amount)
 		topTotal += val
 		badge := itemBadge(e.item.Name, e.item.Type, e.item.Locked)
@@ -915,23 +1013,37 @@ func (b *Bot) cmdInventory(chatID int64, userID int64, steamID string, forceRefr
 			rarity += " "
 		}
 		if e.item.Amount > 1 {
-			fmt.Fprintf(&sb, "%s%s%s%s x%d — %s%.2f\n",
-				rarity, badge, linkedName, extras.String(), e.item.Amount, sym, val)
+			fmt.Fprintf(&sb, "%d. %s%s%s%s x%d — %s%.2f\n",
+				i+1, rarity, badge, linkedName, extras.String(), e.item.Amount, sym, val)
 		} else {
-			fmt.Fprintf(&sb, "%s%s%s%s — %s%.2f\n",
-				rarity, badge, linkedName, extras.String(), sym, e.price)
+			fmt.Fprintf(&sb, "%d. %s%s%s%s — %s%.2f\n",
+				i+1, rarity, badge, linkedName, extras.String(), sym, e.price)
 		}
 	}
 	if len(priced) > limit {
 		fmt.Fprintf(&sb, msgs.InventoryMore, len(priced)-limit)
 	}
-	fmt.Fprintf(&sb, msgs.InventoryTotal, min(limit, len(priced)), sym, topTotal)
-	if noPrice > 0 {
-		fmt.Fprintf(&sb, "\n"+msgs.NoPriceWarning, noPrice)
+	if len(priced) > 0 {
+		fmt.Fprintf(&sb, msgs.InventoryTotal, showN, sym, topTotal)
 	}
 
-	// Build number buttons for item detail (5 per row).
-	invRows := [][]tgbotapi.InlineKeyboardButton{
+	// Show items without prices at the bottom so the user knows they exist.
+	if len(noPriceItems) > 0 {
+		fmt.Fprintf(&sb, "\n"+msgs.NoPriceWarning, len(noPriceItems))
+		const maxShow = 8
+		for i, it := range noPriceItems {
+			if i >= maxShow {
+				fmt.Fprintf(&sb, "\n  <i>…and %d more</i>", len(noPriceItems)-maxShow)
+				break
+			}
+			fmt.Fprintf(&sb, "\n  • %s", esc(shortName(it.Name)))
+		}
+		if !forceRefresh {
+			sb.WriteString("\n<i>Tap 🔄 Refresh to look them up via Steam.</i>")
+		}
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(msgs.BtnChanges, "changes:"+steamID+":24h"),
 			tgbotapi.NewInlineKeyboardButtonData(msgs.BtnValue, "value:"+steamID),
@@ -943,20 +1055,7 @@ func (b *Bot) cmdInventory(chatID int64, userID int64, steamID string, forceRefr
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(msgs.BtnEntryPrices, "entries:"+steamID+":0"),
 		),
-	}
-	// Add one numbered button per shown item (5 per row) so user can tap to open detail.
-	var numRow []tgbotapi.InlineKeyboardButton
-	for i := range topN {
-		numRow = append(numRow, tgbotapi.NewInlineKeyboardButtonData(
-			fmt.Sprintf("%d", i+1),
-			fmt.Sprintf("item_detail:%s:%d", steamID, i),
-		))
-		if len(numRow) == 5 || i == len(topN)-1 {
-			invRows = append(invRows, numRow)
-			numRow = nil
-		}
-	}
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(invRows...)
+	)
 	edit := tgbotapi.NewEditMessageText(chatID, progressMsg.MessageID, sb.String())
 	edit.ParseMode = tgbotapi.ModeHTML
 	edit.ReplyMarkup = &keyboard
@@ -2319,6 +2418,16 @@ func (b *Bot) sendAlert(userID int64, message string) {
 
 // SendAlert is the public entry point used by tracker and reporter packages.
 func (b *Bot) SendAlert(userID int64, message string) { b.sendAlert(userID, message) }
+
+// NotifyAdmin delivers an operational message to the configured admin chat.
+// No-op when ADMIN_USER_ID isn't set (b.adminID == 0).
+func (b *Bot) NotifyAdmin(message string) {
+	if b.adminID == 0 {
+		log.Printf("admin notify (no adminID set): %s", message)
+		return
+	}
+	b.sendAlert(b.adminID, message)
+}
 
 // --- Locking ---
 

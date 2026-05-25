@@ -1,10 +1,13 @@
 package steam
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -13,7 +16,8 @@ import (
 	"time"
 )
 
-const (
+// These are vars (not const) so tests can point them at httptest.NewServer.
+var (
 	inventoryBaseURL = "https://steamcommunity.com/inventory"
 	priceOverviewURL = "https://steamcommunity.com/market/priceoverview/"
 )
@@ -29,17 +33,18 @@ var (
 type Currency struct {
 	Code   int
 	Symbol string
+	Name   string // ISO code, e.g. "USD" — used for Skinport cache lookups
 }
 
 // KnownCurrencies maps ISO currency names to Steam API codes and symbols.
 var KnownCurrencies = map[string]Currency{
-	"USD": {1, "$"},
-	"GBP": {2, "£"},
-	"EUR": {3, "€"},
-	"PLN": {6, "zł"},
-	"RUB": {5, "₽"},
-	"UAH": {18, "₴"},
-	"KZT": {37, "₸"},
+	"USD": {1, "$", "USD"},
+	"GBP": {2, "£", "GBP"},
+	"EUR": {3, "€", "EUR"},
+	"PLN": {6, "zł", "PLN"},
+	"RUB": {5, "₽", "RUB"},
+	"UAH": {18, "₴", "UAH"},
+	"KZT": {37, "₸", "KZT"},
 }
 
 // Item represents a CS2 inventory item (may aggregate multiple assets of the same type).
@@ -65,19 +70,40 @@ type Client struct {
 	Currency      Currency
 }
 
+// randomHex returns a hex string of the given byte length × 2.
+// Used to mint browser-like Steam cookies (sessionid, browserid).
+func randomHex(byteLen int) string {
+	b := make([]byte, byteLen)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func NewClient(sessionCookie string, currency Currency) *Client {
 	jar, _ := cookiejar.New(nil)
-	if sessionCookie != "" {
-		steamURL, _ := url.Parse("https://steamcommunity.com")
-		jar.SetCookies(steamURL, []*http.Cookie{
-			{Name: "steamLoginSecure", Value: sessionCookie},
-		})
-	}
+	steamURL, _ := url.Parse("https://steamcommunity.com")
 
+	// Synthesize the cookies a real Chrome session would carry. Steam's
+	// inventory endpoint sometimes serves stale or truncated snapshots to
+	// requests that look "headless" — supplying these makes us look like a
+	// regular browser session even without a real login.
+	cookies := []*http.Cookie{
+		{Name: "sessionid", Value: randomHex(12)},
+		{Name: "browserid", Value: fmt.Sprintf("%d", time.Now().UnixNano())},
+		{Name: "steamCountry", Value: "US%7C" + randomHex(8)},
+		{Name: "Steam_Language", Value: "english"},
+		{Name: "timezoneOffset", Value: "0,0"},
+	}
+	if sessionCookie != "" {
+		cookies = append(cookies, &http.Cookie{Name: "steamLoginSecure", Value: sessionCookie})
+	}
+	jar.SetCookies(steamURL, cookies)
+
+	// Steam Market API rate-limiter. 4 s between requests keeps us under Steam's
+	// per-IP throttle. Faster (1.5 s) was tried but Steam now 429s persistently.
 	ch := make(chan time.Time, 1)
 	ch <- time.Now()
 	go func() {
-		for t := range time.Tick(1500 * time.Millisecond) {
+		for t := range time.Tick(4000 * time.Millisecond) {
 			ch <- t
 		}
 	}()
@@ -142,12 +168,32 @@ func (c *Client) FetchInventory(steamID string) ([]Item, error) {
 	}
 
 	referer := "https://steamcommunity.com/profiles/" + steamID + "/inventory/"
+
+	// "Warm up" the inventory: hit the profile inventory page first. This
+	// mimics what happens when the user opens their inventory in a browser —
+	// Steam refreshes its server-side inventory snapshot for that user, so
+	// the subsequent /inventory/.../730/2 call returns up-to-date data.
+	// Silent on success — only logs if warmup HTTP call itself fails.
+	c.wait()
+	warmupURL := "https://steamcommunity.com/profiles/" + steamID + "/inventory/?l=english"
+	if warmResp, err := c.doGet(warmupURL, "https://steamcommunity.com/"); err == nil {
+		_, _ = io.Copy(io.Discard, warmResp.Body)
+		warmResp.Body.Close()
+	} else {
+		log.Printf("steam: inventory %s — warmup failed: %v", steamID, err)
+	}
+
 	var allAssets []invAsset
 	descMap := make(map[string]invDesc) // classid:instanceid → description
 	startAssetID := ""
 
 	for fetch := 0; fetch < 20; fetch++ { // safety cap: 20 pages × 2000 = 40 000 items
-		u := fmt.Sprintf("%s/%s/730/2?l=english&count=2000", inventoryBaseURL, steamID)
+		// Cache-bust with a millisecond timestamp — Steam's CDN caches inventory
+		// responses for ~minutes (sometimes hours), which means newly acquired
+		// or traded items would otherwise stay invisible. The "_" param is what
+		// the Steam Community web UI itself uses.
+		u := fmt.Sprintf("%s/%s/730/2?l=english&count=2000&_=%d",
+			inventoryBaseURL, steamID, time.Now().UnixMilli())
 		if startAssetID != "" {
 			u += "&start_assetid=" + startAssetID
 		}
@@ -203,10 +249,12 @@ func (c *Client) FetchInventory(steamID string) ([]Item, error) {
 
 	// Build deduplicated item map (aggregate by MarketHashName).
 	itemMap := make(map[string]*Item)
+	var skippedAssets int // assets whose classid:instanceid has no matching descriptor
 	for _, a := range allAssets {
 		key := a.ClassID + ":" + a.InstanceID
 		d, ok := descMap[key]
 		if !ok {
+			skippedAssets++
 			continue
 		}
 		amount, _ := strconv.Atoi(a.Amount)
@@ -216,6 +264,18 @@ func (c *Client) FetchInventory(steamID string) ([]Item, error) {
 
 		if existing, ok := itemMap[d.MarketHashName]; ok {
 			existing.Amount += amount
+			// Different copies of the same MarketHashName may carry different
+			// Tradable/Marketable flags (e.g. one copy is on 7-day market cooldown,
+			// another isn't). Aggregate with OR so the item is shown if AT LEAST
+			// ONE copy is tradable/marketable — otherwise the bot would silently
+			// drop the whole stack just because the first asset iterated happened
+			// to be the cooled-down one.
+			if d.Tradable == 1 {
+				existing.Tradable = true
+			}
+			if d.Marketable == 1 {
+				existing.Marketable = true
+			}
 			if d.Tradable == 0 && d.Marketable == 1 {
 				existing.Locked = true
 			}
@@ -246,8 +306,28 @@ func (c *Client) FetchInventory(steamID string) ([]Item, error) {
 	}
 
 	items := make([]Item, 0, len(itemMap))
+	var marketable, nonMarketable int
 	for _, it := range itemMap {
 		items = append(items, *it)
+		if it.Marketable {
+			marketable++
+		} else {
+			nonMarketable++
+		}
+	}
+	log.Printf("steam: inventory %s — %d assets → %d unique types (%d marketable, %d non-marketable)",
+		steamID, len(allAssets), len(items), marketable, nonMarketable)
+	if skippedAssets > 0 {
+		log.Printf("steam: inventory %s — WARNING: %d assets skipped (no matching descriptor)",
+			steamID, skippedAssets)
+	}
+	// Heuristic: a fresh, signed-in browser session typically returns the user's
+	// full inventory. If we only get a handful of items it usually means the
+	// STEAM_SESSION_COOKIE in .env is stale (JWT expired) and Steam is serving a
+	// cached/limited snapshot. Warn the operator so they know to refresh it.
+	if len(allAssets) < 20 && len(allAssets) > 0 {
+		log.Printf("steam: inventory %s — NOTE: only %d assets returned, STEAM_SESSION_COOKIE may be stale",
+			steamID, len(allAssets))
 	}
 	return items, nil
 }
@@ -324,6 +404,9 @@ func (c *Client) doGet(u, referer string) (*http.Response, error) {
 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// Force Steam's CDN to return a fresh response, not a cached snapshot.
+	req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	req.Header.Set("Pragma", "no-cache")
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}

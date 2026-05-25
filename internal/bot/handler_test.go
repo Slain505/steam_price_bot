@@ -2,6 +2,8 @@ package bot
 
 import (
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -85,7 +87,7 @@ func TestItemBadge(t *testing.T) {
 		},
 		{
 			name: "Sticker | Fnatic", itemType: "Sticker",
-			contains: []string{"🏷"}, absent: []string{"FT", "FN"},
+			contains: []string{"🧩"}, absent: []string{"FT", "FN"},
 		},
 		{
 			name: "Danger Zone Case", itemType: "Base Grade Container",
@@ -212,5 +214,87 @@ func TestMin(t *testing.T) {
 		if got := min(tt.a, tt.b); got != tt.want {
 			t.Errorf("min(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
 		}
+	}
+}
+
+// --- forceRefresh cooldown ---
+
+// newBotForCooldown builds a minimal Bot value just for checkForceCooldown tests.
+// Skips the Telegram API connection entirely.
+func newBotForCooldown() *Bot {
+	return &Bot{
+		lastForceByUser: make(map[int64]time.Time),
+	}
+}
+
+func TestCheckForceCooldown_FirstCall(t *testing.T) {
+	b := newBotForCooldown()
+	if remaining := b.checkForceCooldown(1); remaining != 0 {
+		t.Errorf("first call: want 0, got %v", remaining)
+	}
+}
+
+func TestCheckForceCooldown_SecondCallBlocked(t *testing.T) {
+	b := newBotForCooldown()
+	b.checkForceCooldown(1) // arms the cooldown
+
+	remaining := b.checkForceCooldown(1)
+	if remaining <= 0 {
+		t.Errorf("second call within cooldown: want positive duration, got %v", remaining)
+	}
+	if remaining > forceRefreshCooldown {
+		t.Errorf("remaining %v should not exceed cooldown %v", remaining, forceRefreshCooldown)
+	}
+}
+
+func TestCheckForceCooldown_PerUserIsolation(t *testing.T) {
+	b := newBotForCooldown()
+	b.checkForceCooldown(1) // user 1 is on cooldown
+
+	// User 2's first call must succeed even though user 1 is throttled.
+	if remaining := b.checkForceCooldown(2); remaining != 0 {
+		t.Errorf("user 2 first call should be unaffected by user 1: got %v", remaining)
+	}
+}
+
+func TestCheckForceCooldown_ExpiresAfterWindow(t *testing.T) {
+	b := newBotForCooldown()
+
+	// Backdate the user's last call to before the cooldown window.
+	b.lastForceByUser[1] = time.Now().Add(-2 * forceRefreshCooldown)
+
+	if remaining := b.checkForceCooldown(1); remaining != 0 {
+		t.Errorf("call after window expiry: want 0, got %v", remaining)
+	}
+}
+
+func TestCheckForceCooldown_ConcurrentSafe(t *testing.T) {
+	b := newBotForCooldown()
+
+	// 20 goroutines hammering the same user — exactly one must succeed,
+	// the rest must be blocked.
+	const userID = int64(42)
+	const callers = 20
+
+	var successCount, blockedCount atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			if b.checkForceCooldown(userID) == 0 {
+				successCount.Add(1)
+			} else {
+				blockedCount.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successCount.Load() != 1 {
+		t.Errorf("exactly one caller should succeed; got %d", successCount.Load())
+	}
+	if blockedCount.Load() != callers-1 {
+		t.Errorf("the other %d callers should be blocked; got %d", callers-1, blockedCount.Load())
 	}
 }

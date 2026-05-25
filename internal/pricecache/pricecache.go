@@ -3,6 +3,7 @@ package pricecache
 import (
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,10 +16,16 @@ import (
 )
 
 const (
-	skinportURL    = "https://api.skinport.com/v1/items?app_id=730&currency=%s"
 	refreshEvery   = 6 * time.Hour
 	requestTimeout = 60 * time.Second
 )
+
+// skinportURL is a var (not const) so tests can point it at httptest.NewServer.
+var skinportURL = "https://api.skinport.com/v1/items?app_id=730&currency=%s"
+
+// ErrRateLimit is returned by Refresh when Skinport responds with HTTP 429.
+// Use errors.Is(err, ErrRateLimit) to test instead of substring matching.
+var ErrRateLimit = errors.New("skinport rate limit")
 
 // Cache holds bulk prices fetched from the Skinport API.
 // It is safe for concurrent reads and periodic background writes.
@@ -66,16 +73,32 @@ func (c *Cache) FetchedAt(currency string) (time.Time, bool) {
 	return t, ok
 }
 
-// StartAutoRefresh immediately fetches prices for each currency and then
-// repeats every refreshEvery interval in the background.
-// Currencies that Skinport does not support (RUB, KZT) are silently skipped.
+// skinportFetchDelay is the pause between consecutive Skinport requests when
+// fetching multiple currencies to stay within the API rate limit.
+const skinportFetchDelay = 10 * time.Second
+
+// StartAutoRefresh loads prices for each currency synchronously, then schedules
+// a periodic background refresh every refreshEvery interval.
+// The initial fetch blocks startup so the cache is ready when the bot accepts
+// its first user request.
+// Pass nil (or empty slice) to skip — useful when the configured currency is
+// not supported by Skinport.
 func (c *Cache) StartAutoRefresh(currencies []string) {
-	for _, cur := range currencies {
+	if len(currencies) == 0 {
+		return
+	}
+
+	log.Printf("pricecache: loading initial prices for %v from Skinport...", currencies)
+	for i, cur := range currencies {
 		cur := strings.ToUpper(cur)
-		if err := c.Refresh(cur); err != nil {
-			log.Printf("pricecache: initial fetch %s: %v", cur, err)
+		if err := c.refreshWithRetry(cur); err != nil {
+			log.Printf("pricecache: initial fetch %s failed: %v", cur, err)
+		}
+		if i < len(currencies)-1 {
+			time.Sleep(skinportFetchDelay)
 		}
 	}
+	log.Println("pricecache: initial load complete")
 
 	go func() {
 		ticker := time.NewTicker(refreshEvery)
@@ -83,10 +106,13 @@ func (c *Cache) StartAutoRefresh(currencies []string) {
 		for {
 			select {
 			case <-ticker.C:
-				for _, cur := range currencies {
+				for i, cur := range currencies {
 					cur := strings.ToUpper(cur)
-					if err := c.Refresh(cur); err != nil {
+					if err := c.refreshWithRetry(cur); err != nil {
 						log.Printf("pricecache: refresh %s: %v", cur, err)
+					}
+					if i < len(currencies)-1 {
+						time.Sleep(skinportFetchDelay)
 					}
 				}
 			case <-c.quit:
@@ -94,6 +120,32 @@ func (c *Cache) StartAutoRefresh(currencies []string) {
 			}
 		}
 	}()
+}
+
+// refreshWithRetry wraps Refresh with automatic back-off on ErrRateLimit.
+// Retries up to maxRetries times with the given waits between attempts.
+// Non-rate-limit errors are returned immediately.
+func (c *Cache) refreshWithRetry(currency string) error {
+	// Total worst-case wait: 10s + 20s = 30s. Down from 90s.
+	waits := []time.Duration{10 * time.Second, 20 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt <= len(waits); attempt++ {
+		if attempt > 0 {
+			wait := waits[attempt-1]
+			log.Printf("pricecache: rate-limited on %s, retrying in %s (attempt %d/%d)",
+				currency, wait, attempt, len(waits))
+			time.Sleep(wait)
+		}
+		err := c.Refresh(currency)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrRateLimit) {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
 }
 
 // Stop shuts down the background refresh goroutine.
@@ -151,6 +203,10 @@ func fetchSkinport(currency string) ([]skinportItem, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == 429 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%w: %s", ErrRateLimit, string(body))
+	}
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("skinport HTTP %d: %s", resp.StatusCode, string(body))
